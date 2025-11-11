@@ -1,41 +1,48 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-import json
 import os
+import json
 import requests
-import re
+import numpy as np
+from sentence_transformers import SentenceTransformer, util
 from dotenv import load_dotenv
+import re
 
-load_dotenv("api.env")  # get the api from env file
+# Load environment variables
+load_dotenv(os.path.join(os.path.dirname(__file__), "api.env"))
+NEW_API_KEY = os.getenv("NEW_API_KEY")
+print("DEBUG: Using OpenRouter API key:", NEW_API_KEY is not None)
 
-app = FastAPI() # start fastapi app here
-
-origins = [ # setting up cors here for frontend, will change it later to match alejandro's code
-    "http://localhost:3000"
-]
+# FastAPI setup
+app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,
+    allow_origins=["http://localhost:3000"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+#file paths
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))  # backend/
+ROOT_DIR = os.path.dirname(BASE_DIR)                   # project root
+KB_PATH = os.path.join(ROOT_DIR, "data", "kb.json")    
+EMBED_PATH = os.path.join(ROOT_DIR, "kb_embeddings.npy")
+QUESTIONS_PATH = os.path.join(ROOT_DIR, "kb_questions.json")
+
+
+
+# Load knowledge base
 try:
-    with open("../data/kb.json", "r", encoding="utf-8") as f:
+    with open(KB_PATH, "r", encoding="utf-8") as f:
         kb = json.load(f)
+    print(f"DEBUG: Loaded KB with {len(kb)} entries")
 except FileNotFoundError:
     kb = []
-    
-# load api keys     
-DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
+    print("⚠️ KB not found, kb.json missing!")
 
-print("OPENROUTER_API_KEY loaded:", OPENROUTER_API_KEY is not None)
-print("DEEPSEEK_API_KEY loaded:", DEEPSEEK_API_KEY is not None)
-
-
+# Request model structure
 class Question(BaseModel):
     question: str
 
@@ -43,108 +50,118 @@ class Question(BaseModel):
 def read_root():
     return {"message": "Backend is working!"}
 
-def match_kb(user_question: str):
+# Initialize embedding model
+embedding_model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+
+def load_or_create_embeddings():
+    """Load embeddings from file if they match KB; otherwise, create and save them."""
+    if not kb:
+        print("Knowledge base is empty.")
+        return []
+
+    kb_questions = [item.get("question", "") for item in kb if "question" in item]
+
+    if os.path.exists(QUESTIONS_PATH) and os.path.exists(EMBED_PATH):
+        try:
+            with open(QUESTIONS_PATH, "r", encoding="utf-8") as f:
+                stored_questions = json.load(f)
+            if stored_questions == kb_questions:
+                print("Loading cached embeddings...")
+                return np.load(EMBED_PATH)
+            else:
+                print("KB changed — regenerating embeddings...")
+        except Exception as e:
+            print("Error loading cached embeddings:", e)
+
+    print("Computing embeddings for KB...")
+    embeddings = embedding_model.encode(kb_questions, convert_to_numpy=True)
+
+    np.save(EMBED_PATH, embeddings)
+    with open(QUESTIONS_PATH, "w", encoding="utf-8") as f:
+        json.dump(kb_questions, f, ensure_ascii=False, indent=2)
+
+    print("Embeddings saved successfully.")
+    return embeddings
+
+kb_embeddings = load_or_create_embeddings()
+
+def normalize_text(text: str):
+    """Normalize text for semantic search."""
+    return re.sub(r"[^\w\s]", "", text.lower().strip())
+
+def find_kb_answer(user_question: str):
     """
-    Try to find an answer in the knowledge base that matches the user's question.
+    First tries to find an exact match in the KB.
+    If no exact match, performs semantic search as fallback.
     """
-    user_question_lower = user_question.lower().strip()
-    user_words = set(re.findall(r"\b\w+\b", user_question_lower))
-
-    stopwords = {    # stopwoords to ignore in questions (not mixing stuff up)
-        "the", "is", "at", "where", "can", "i", "get", "to", "my", "a", "an",
-        "on", "of", "for", "and", "how", "do", "you", "in", "office"
-    }
-    user_words = {w for w in user_words if w not in stopwords}
-
-    greetings = ["hi", "hello", "hey", "good morning", "good afternoon", "good evening"]
-    if any(greet in user_question_lower for greet in greetings):
-        return "Hello! How may I help you?"
-
-    best_match = None
-    best_score = 0
+    # 1️⃣ Exact match check
     for item in kb:
-        kb_words = set(re.findall(r"\b\w+\b", item.get("question", "").lower()))
-        kb_words = {w for w in kb_words if w not in stopwords}
-        overlap = len(user_words & kb_words)
-        score = overlap / len(kb_words) if kb_words else 0
+        if item.get("question", "").strip().lower() == user_question.lower():
+            print("DEBUG: Exact KB match found")
+            return item["answer"]
 
-        keywords = [k.lower() for k in item.get("keywords", [])]
-        if any(kw in user_question_lower for kw in keywords):
-            score += 0.3
+    # 2️⃣ Semantic search fallback
+    if not kb or len(kb_embeddings) == 0:
+        return None
 
-        if score > best_score:
-            best_score = score
-            best_match = item
+    user_question_norm = normalize_text(user_question)
+    query_embedding = embedding_model.encode(user_question_norm, convert_to_numpy=True)
+    similarities = util.cos_sim(query_embedding, kb_embeddings)[0]
 
-    if best_match and best_score > 0.15:
-        return best_match["answer"]
+    best_idx = int(np.argmax(similarities))
+    best_score = float(similarities[best_idx])
+
+    print(f"DEBUG: Semantic match score: {best_score:.3f}, question: {kb[best_idx]['question']}")
+    
+    # Only return semantic answer if similarity is reasonably high
+    if best_score >= 0.6:
+        return kb[best_idx]["answer"]
+
+    # No KB answer found
     return None
 
 @app.post("/ask")
 def ask_question(question: Question):
     user_question = question.question.strip()
-    print("Received question:", user_question)
 
-# attempt to get answer from the kb 
-    kb_answer = match_kb(user_question)
+    # Check KB first
+    kb_answer = find_kb_answer(user_question)
     if kb_answer:
-        print("Answer from KB:", kb_answer)
         return {"answer": kb_answer}
 
-    # choose which api (ask bakr abt this)
-    if OPENROUTER_API_KEY:
-        url = "https://openrouter.ai/api/v1/chat/completions"
-        api_key = OPENROUTER_API_KEY
-        model = "gpt-4o-mini"
-    elif DEEPSEEK_API_KEY:
-        url = "https://api.deepseek.com/v1/chat/completions"
-        api_key = DEEPSEEK_API_KEY
-        model = "deepseek-chat"
-    else:
-        print("No API key set")
-        return {"answer": "API key not found. Set DEEPSEEK_API_KEY or OPENROUTER_API_KEY."}
+    # Fallback to OpenRouter API
+    if not NEW_API_KEY:
+        return {"answer": "API key not found."}
 
+    url = "https://openrouter.ai/api/v1/chat/completions"
     headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json"
+        "Authorization": f"Bearer {NEW_API_KEY}",
+        "Content-Type": "application/json",
     }
     payload = {
-        "model": model,
+        "model": "gpt-4o-mini",
         "messages": [
-            {"role": "system", "content": "You are a helpful assistant for Vistula University students."},
+            {
+                "role": "system",
+                "content": "You are an intelligent AI assistant that helps users with their questions regarding the university. Answer clearly and politely.",
+            },
             {"role": "user", "content": user_question}
         ],
         "stream": False
     }
- 
-    # response handling, error messages etc
+
     try:
-        print("Sending request to API...")
-        response = requests.post(url, json=payload, headers=headers, timeout=15)
-        print("Raw response status:", response.status_code)
-
+        print("DEBUG: Sending request to OpenRouter...")
+        response = requests.post(url, headers=headers, json=payload, timeout=20)
         response.raise_for_status()
-        try:
-            data = response.json()
-        except json.JSONDecodeError:
-            return {"answer": f"API returned non-JSON response. Content starts with:\n{response.text[:500]}"}
-
-        answer = None
-        if "choices" in data and len(data["choices"]) > 0:
-            answer = data["choices"][0].get("message", {}).get("content")
-        elif "result" in data:
-            answer = data.get("result")
-
-        if answer:
-            print("Answer from API:", answer)
-            return {"answer": answer.strip()}
-        elif "error" in data:
-            print("API error:", data["error"])
-            return {"answer": f"API error: {data['error']}"}
-        else:
-            print("Unknown response structure:", data)
-            return {"answer": "I don't know yet."}
-
+        data = response.json()
+        answer = data.get("choices", [{}])[0].get("message", {}).get("content", "No answer returned.")
+        return {"answer": answer.strip()}
     except requests.exceptions.RequestException as e:
-        print("Request exception:", e)
-        return {"answer": f"API request error: {e}"}
+        print("⚠️ OpenRouter request failed:", e)
+        return {"answer": f"⚠️ API request error: {e}"}
+
+# Run backend
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="127.0.0.1", port=5000)
