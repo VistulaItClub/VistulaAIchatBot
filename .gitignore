@@ -1,0 +1,35 @@
+# Environment variables and API keys
+backend/api.env
+*.env
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+.venv/
+ENV/
+env/
+
+# Embeddings and generated files
+kb_embeddings.npy
+kb_questions.json
+
+# Database
+chroma_db/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
